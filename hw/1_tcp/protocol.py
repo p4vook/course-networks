@@ -41,6 +41,9 @@ class MyTCPProtocol(UDPBasedProtocol):
             self.start = start
             self.end = end
             self.pid = pid
+        
+        def __bool__(self):
+            return self.pid != 0
 
         @classmethod
         def from_bytes(self, packet_bytes: bytes):
@@ -94,6 +97,8 @@ class MyTCPProtocol(UDPBasedProtocol):
                     print("No meta available :(", flush=True)
                 else:
                     ack_meta = self.get_acknowledge()
+                    if not ack_meta:
+                        return n
                     recvd = datetime.datetime.now()
                     delta_us = (recvd - packet_sent_time[ack_meta.pid]).microseconds
                     print(f"Received ack ({ack_meta.start}, {ack_meta.end}, {ack_meta.pid}), delta {delta_us}", flush=True)
@@ -101,7 +106,7 @@ class MyTCPProtocol(UDPBasedProtocol):
                     if ack_meta.start <= first_unack and ack_meta.end > first_unack:
                         first_unack = ack_meta.end
                 print(f"First unack {first_unack}, delay {current_delay_us}", flush=True)
-        while ack_meta.pid != 0:
+        while ack_meta:
             ack_meta = self.get_acknowledge()
         return n
 
@@ -121,6 +126,7 @@ class MyTCPProtocol(UDPBasedProtocol):
                 res += packet_bytes[segment_start:segment_end]
                 first_unreceived = len(res)
             self.send_acknowledge(meta)
+        print("Sending FIN", flush=True)
         self.send_acknowledge(self.PacketMeta(0, 0, 0))
         return res[:n]
     
