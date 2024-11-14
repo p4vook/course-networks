@@ -1,6 +1,9 @@
 import socket
 from random import randint 
 from enum import Enum
+from threading import Thread
+from datetime import datetime
+from select import select
 
 
 class UDPBasedProtocol:
@@ -31,8 +34,9 @@ def bytes_to_number(bytearray: bytes) -> int:
 class PacketType(Enum):
     DATA = 1
     SYN = 2
-    ACK = 3
-    FIN = 4
+    SYNACK = 3
+    ACK = 4
+    FIN = 5
 
 
 class PacketMeta:
@@ -63,32 +67,49 @@ def bytes_to_meta(byte_meta: bytes) -> PacketMeta:
     typ, start, end, seq = (bytes_to_number(byte_meta[i:i+NS]) for i in range(0, MS, NS))
     return PacketMeta(PacketType(typ), start, end, seq)
 
+
+class Packet:
+    meta: PacketMeta
+    segment: bytes
+
+
 class PacketProtocol:
     SEGMENT_SIZE = 4000
     PACKET_SIZE = PacketMeta.META_SIZE + SEGMENT_SIZE
+
+    DEFAULT_DELAY_US = 2000
+    SYN_TIMEOUT_US = 100000
+    FIN_TIMEOUT_US = 100000
+
     udp: UDPBasedProtocol
 
     def __init__(self, udp) -> None:
         self.udp = udp
 
-    def receive_packet(self) -> tuple[PacketMeta, bytes]:
+    def receive_packet(self) -> Packet:
         packet_bytes = self.udp.recvfrom(self.PACKET_SIZE)
         packet_meta = bytes_to_meta(packet_bytes[:PacketMeta.META_SIZE])
-        return (packet_meta, packet_bytes[self.PACKET_SIZE:])
+        return packet_meta, packet_bytes[self.PACKET_SIZE:]
     
-    def send_packet(self, meta: PacketMeta, segment: bytes) -> bool:
-        packet_bytes = meta.to_bytes() + segment
+    def send_packet(self, packet: Packet) -> bool:
+        packet_bytes = packet.meta.to_bytes() + packet.segment
         assert len(packet_bytes) == self.PACKET_SIZE
         return self.udp.sendto(packet_bytes) == self.PACKET_SIZE
+
+    def delay_step(previous_delay: int, current_delay: int) -> int:
+        return (previous_delay * 4 + current_delay) // 5
 
 
 class TCPReader:
     protocol: PacketProtocol
     buf = bytes()
+    reader_thread: Thread
     buf_ptr = 0
 
     def __init__(self, protocol: PacketProtocol) -> None:
         self.protocol = protocol
+        self.reader_thread = Thread(target=self.read_to_buf)
+        self.reader_thread.start()
     
     # Reads bytes into buf.
     def read_to_buf(self) -> None:
@@ -108,16 +129,53 @@ class TCPReader:
             self.protocol.send_packet(response_meta, bytes(PacketProtocol.PACKET_SIZE))
             while meta.typ != PacketType.DATA and meta.typ != PacketType.FIN:
                 meta, segment = self.protocol.receive_packet()
-        self.protocol.send_packet(meta)
+        self.protocol.send_packet(Packet(meta, bytes(PacketProtocol.PACKET_SIZE)))
     
     def read(self, n: int) -> bytes:
+        self.reader_thread.join()
         assert self.buf_ptr + n <= len(self.buf)
         return self.buf[self.buf_ptr:self.buf_ptr + n]
 
 
+class TCPWriter:
+    protocol: PacketProtocol
+    seq_start: int
+    cur_seq: int
+    packet_sent_ts: dict[int, datetime]
+    cur_delay_us: int = PacketProtocol.DEFAULT_DELAY_US
+
+    def __init__(self, protocol: PacketProtocol) -> None:
+        self.protocol = protocol
+    
+    def get_one_packet(self,
+                       timeout: int | None) -> Packet | None:
+        if timeout:
+            if not select.select([self.protocol.udp], [], [], timeout):
+                return None
+        return self.protocol.receive_packet()
+    
+    def get_packet(self, 
+                   blocking: bool = True,
+                   seq: int | None = None,
+                   timeout: int | None = None
+
+
+    def write(self, buf: bytes) -> int:
+        n = len(buf)
+        while 
+        self.protocol.send_packet()
+        return n
+
 class MyTCPProtocol(UDPBasedProtocol):
+    protocol: PacketProtocol
+    reader: TCPReader
+    writer: TCPWriter
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.protocol = PacketProtocol(self.udp_socket)
+        self.reader = TCPReader(self.protocol)
+        self.writer = TCPWriter(self.protocol)
 
     def send(self, data: bytes):
         return self.sendto(data)
