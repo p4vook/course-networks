@@ -79,7 +79,7 @@ class Packet:
     meta: PacketMeta
     segment: bytes
 
-    def __init__(self, meta: PacketMeta, segment: bytes) -> None:
+    def __init__(self, meta: PacketMeta, segment: bytes = bytes(SEGMENT_SIZE)) -> None:
         assert len(segment) == self.SEGMENT_SIZE
         self.meta = meta
         self.segment = segment
@@ -89,8 +89,8 @@ class Packet:
 
 class PacketProtocol:
     DEFAULT_DELAY_US = 2000
-    SYN_TIMEOUT_US = 100000
-    FIN_TIMEOUT_US = 100000
+    SYN_TIMEOUT = 0.1
+    FIN_TIMEOUT = 0.1
 
     udp: UDPBasedProtocol
 
@@ -110,18 +110,23 @@ class PacketProtocol:
         return self.udp.sendto(packet_bytes) == Packet.SIZE
 
     def get_one_packet(self,
-                       timeout: int | None = None) -> Packet | None:
+                       timeout: float | None = None) -> Packet | None:
         if timeout:
+            print(f"selecting with timeout {timeout}", flush=True)
             if not select([self.udp.udp_socket], [], [], timeout):
                 return None
+            print("select finished")
         return self.receive_packet()
 
     def get_packet(self, 
                    typ: list[PacketType] = [],
                    packet_filter: Callable[[Packet], bool] = lambda _: True,
-                   timeout: int | None = None) -> Packet:
+                   timeout: float | None = None) -> Packet:
+        print(f"Accepted typs: {typ}")
         packet = self.get_one_packet(timeout)
         typ_filter = lambda packet: typ is None or packet.meta.typ in typ
+        if packet:
+            print(f"Received packet {(packet.meta.typ, packet.meta.seq)}, {typ_filter(packet)} && {packet_filter(packet)}", flush=True)
         while packet and not (typ_filter(packet) and packet_filter(packet)):
             # sloppy timeout handling but hopefully it won't break us
             packet = self.get_one_packet(timeout)
@@ -146,7 +151,6 @@ class TCPReader:
     
     # Reads bytes into buf.
     def read_to_buf(self) -> None:
-        self.protocol.get_packet(typ=[PacketType.SYN])
         meta, segment = self.protocol.get_packet(typ = [PacketType.SYN])
         while meta.typ != PacketType.FIN:
             first_unreceived = 0
@@ -158,9 +162,9 @@ class TCPReader:
                 first_unreceived = meta.end
             response_meta = meta
             response_meta.typ = PacketType.ACK
-            self.protocol.send_packet(Packet(response_meta, bytes(Packet.SIZE)))
+            self.protocol.send_packet(Packet(response_meta))
             meta, segment = self.protocol.get_packet(typ=[PacketType.DATA, PacketType.FIN])
-        self.protocol.send_packet(Packet(meta, bytes(Packet.SIZE)))
+        self.protocol.send_packet(Packet(meta))
     
     def read(self, n: int) -> bytes:
         self.reader_thread.join()
@@ -184,13 +188,15 @@ class TCPWriter:
         n = len(buf)
         while True:
             meta = PacketMeta(PacketType.SYN, 0, 0, self.cur_seq)
-            self.protocol.send_packet(Packet(meta, bytes(Packet.SEGMENT_SIZE)))
+            self.protocol.send_packet(Packet(meta))
+            print("Waiting for ack on SYN", flush=True)
             try: 
                 self.protocol.get_packet(typ=[PacketType.ACK],
                                          packet_filter=lambda packet: packet.meta.seq == self.cur_seq,
-                                         timeout=self.protocol.SYN_TIMEOUT_US)
+                                         timeout=self.protocol.SYN_TIMEOUT)
                 break
             except TimeoutError:
+                print("Timeout", flush=True)
                 pass
         first_unack = 0
         while first_unack < n:
