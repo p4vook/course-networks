@@ -7,20 +7,53 @@ from select import select
 from typing import Callable
 from time import sleep
 import logging
+import logging.config
 
-logging.basicConfig(filename=f"logs/tcp-{datetime.now().isoformat()}.log",
-                    level=logging.DEBUG, 
-                    format="%(asctime)s\t%(levelname)s\t%(name)s\t%(message)s")
+
+logNow = datetime.now().isoformat()
+
+logging.config.dictConfig(
+    {
+        "version": 1,
+        "formatters": {
+            "precise": {
+                "format": "%(asctime)s\t%(levelname)s\t%(name)s\t%(message)s",
+            },
+        },
+        "handlers": {
+            "debug_file": {
+                "class": "logging.FileHandler",
+                "formatter": "precise",
+                "filename": f"logs/tcp-{logNow}-debug.log",
+                "level": "DEBUG",
+            },
+            "regular_file": {
+                "class": "logging.FileHandler",
+                "formatter": "precise",
+                "filename": f"logs/tcp-{logNow}.log",
+                "level": "INFO",
+            },
+        },
+        "loggers": {
+            "tcp": {
+                "handlers": ["debug_file", "regular_file"],
+            },
+        },
+    }
+)
+
+logger = logging.getLogger("tcp")
+logger.setLevel(logging.DEBUG)
 
 class UDPBasedProtocol:
-    udp_logger = logging.root.getChild("UDPBase")
+    udp_logger = logger.getChild("UDPBase")
 
     def __init__(self, *, local_addr, remote_addr) -> None:
+        self.udp_logger.info(f"Opening socket {local_addr} <-> {remote_addr}")
         self.udp_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
         self.local_addr = local_addr
         self.remote_addr = remote_addr
         self.udp_socket.bind(local_addr)
-        self.udp_logger.info(f"Initialized socket {self.local_addr} <-> {self.remote_addr}")
 
     def sendto(self, data) -> int:
         self.udp_logger.debug(f"Sending {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
@@ -35,6 +68,7 @@ class UDPBasedProtocol:
         return msg
 
     def close(self) -> None:
+        self.udp_logger.info(f"Closing socket {self.local_addr} <-> {self.remote_addr}")
         self.udp_socket.close()
 
 
@@ -92,6 +126,7 @@ def bytes_to_meta(byte_meta: bytes) -> PacketMeta:
 
 class Packet:
     SEGMENT_SIZE = 4000
+    PACKET_SIZE = PacketMeta.META_SIZE + SEGMENT_SIZE
 
     meta: PacketMeta
     segment: bytes
@@ -101,6 +136,7 @@ class Packet:
             assert len(segment) == self.SEGMENT_SIZE
         else: 
             assert len(segment) == 0
+            segment = bytes(self.SEGMENT_SIZE)
         self.meta = meta
         self.segment = segment
 
@@ -113,7 +149,7 @@ class PacketProtocol:
     FIN_TIMEOUT = 0.1
     STEP = 0.001
 
-    logger = logging.root.getChild("Proto")
+    logger = logger.getChild("Proto")
     hooks: list[Callable[[Packet], None]] = []
 
     udp: UDPBasedProtocol
@@ -123,11 +159,11 @@ class PacketProtocol:
         self.logger.info(f"Initialized protocol {udp.local_addr} -> {udp.remote_addr}")
     
     def receive_packet(self) -> Packet:
-        meta_bytes = self.udp.recvfrom(PacketMeta.META_SIZE)
-        packet_meta = bytes_to_meta(meta_bytes)
+        packet_bytes = self.udp.recvfrom(Packet.PACKET_SIZE)
+        packet_meta = bytes_to_meta(packet_bytes[:PacketMeta.META_SIZE])
         segment_bytes = bytes()
         if packet_meta.typ == PacketType.DATA:
-            segment_bytes = self.udp.recvfrom(Packet.SEGMENT_SIZE)
+            segment_bytes = packet_bytes[PacketMeta.META_SIZE:]
         packet = Packet(packet_meta, segment_bytes)
         self.logger.debug(f"Received packet {packet.meta} with length {len(segment_bytes)}")
         return packet
@@ -169,16 +205,17 @@ class TCPReader:
     DATA_WAIT_US = 500*10**3
     ESTABLISHED_WAIT_US = 3*10**6
     FIN_WAIT_US = 500*10**3
+    ACK_WAIT_US = 500*10**3
 
     protocol: PacketProtocol
     state = State.SYN_WAIT
     buf = bytes()
     buf_ptr = 0
-    seq_start: int
+    seq_start = -1
     last_seq: int
     wait_start = datetime.now()
     first_unreceived = 0
-    logger = logging.root.getChild("Reader")
+    logger = logger.getChild("Reader")
 
     def __init__(self, protocol: PacketProtocol) -> None:
         self.protocol = protocol
@@ -188,7 +225,7 @@ class TCPReader:
         return in_seq_segment(seq, self.seq_start, (self.last_seq + SEQ_TOLERANCE) % 2**32)
 
     def handle_input(self, input: Packet | None) -> None:
-        self.logger.debug(f"Handling input {input.meta if input else None} from {self.state}")
+        self.logger.debug(f"Handling input {input.meta if input else None} from {self.state}, seq={self.seq_start}")
         now = datetime.now()
         if self.state == self.State.SYN_WAIT:
             if not input or input.meta.typ != PacketType.SYN:
@@ -209,36 +246,41 @@ class TCPReader:
             self.wait_start = now
             self.state = self.State.ESTABLISHED
         elif self.state == self.State.ESTABLISHED:
-            if not input \
-               or not (input.meta.typ == PacketType.DATA and self.valid_seq(input.meta.seq)) \
-               or not (input.meta.typ == PacketType.FIN and input.meta.seq == self.seq_start):
+            if not input or \
+               (not (input.meta.typ == PacketType.DATA and self.valid_seq(input.meta.seq)) and \
+                not (input.meta.typ == PacketType.FIN and input.meta.seq == self.seq_start)):
                 if (now - self.wait_start).microseconds > self.DATA_WAIT_US:
                     self.state = self.State.SYN_WAIT
                 return
             self.wait_start = now
             if input.meta.typ == PacketType.FIN:
                 self.protocol.send_packet(Packet(PacketMeta(PacketType.FIN, 0, 0, self.seq_start)))
-                self.state = self.State.ACK_WAIT
+                self.state = self.State.FIN_WAIT
+                return
             if input.meta.start > self.first_unreceived:
                 return
+            self.logger.debug(f"Received bytes bytes {input.segment[:input.meta.end - input.meta.start]!r}")
             if self.first_unreceived < input.meta.end:
-                self.buf += input.segment[self.first_unreceived-input.meta.start:input.meta.end]
+                self.buf += input.segment[self.first_unreceived-input.meta.start:input.meta.end][::]
                 self.first_unreceived = input.meta.end
             self.protocol.send_packet(Packet(PacketMeta(PacketType.ACK, input.meta.start, input.meta.end, input.meta.seq)))
-        elif self.state == self.State.ACK_WAIT:
+        elif self.state == self.State.FIN_WAIT:
             if not input or not (input.meta.typ == PacketType.ACK and input.meta.seq == self.seq_start):
-                if (now - self.wait_start).microseconds() > self.DATA_WAIT_US:
-                    self.wait_start = now
+                if (now - self.wait_start).microseconds > self.ACK_WAIT_US:
                     self.state = self.State.ESTABLISHED
                 return
             self.wait_start = now
             self.state = self.State.SYN_WAIT
 
     def do_read(self, n: int) -> bytes:
-        self.logger.info(f"Doing Read of {n} bytes")
-        while self.buf_ptr + n < len(self.buf):
+        self.logger.info(f"Doing read of {n} bytes on {self.protocol.udp.local_addr}, {self.buf_ptr}")
+        while self.buf_ptr + n > len(self.buf):
             sleep(PacketProtocol.STEP)
-        return self.buf[self.buf_ptr:self.buf_ptr + n]
+        self.logger.info(f"Done read of {n} bytes on {self.protocol.udp.local_addr}") 
+        res = self.buf[self.buf_ptr:self.buf_ptr + n][::]
+        self.buf_ptr += n
+        self.logger.debug(f"Bytes {res!r}")
+        return res
 
 
 class TCPWriter:
@@ -257,13 +299,13 @@ class TCPWriter:
     state: State = State.DEFAULT
     buf: bytes = bytes()
     wait_start = datetime.now()
-    seq_start: int
+    seq_start = -1
     cur_seq: int
     first_unack: int
     cur_delay_us: int = PacketProtocol.DEFAULT_DELAY_US
     packet_sent: dict[int, datetime]
     protocol: PacketProtocol
-    logger = logging.root.getChild("Writer")
+    logger = logger.getChild("Writer")
 
     def __init__(self, protocol: PacketProtocol) -> None:
         self.protocol = protocol
@@ -272,7 +314,7 @@ class TCPWriter:
         return in_seq_segment(seq, self.seq_start, self.cur_seq)
 
     def handle_input(self, input: Packet | None) -> None:
-        self.logger.debug(f"Handling input {input.meta if input else None} from state {self.state}")
+        self.logger.debug(f"Handling input {input.meta if input else None} from {self.state}, seq={self.seq_start}")
         now = datetime.now()
         if self.state == self.State.DEFAULT:
             pass
@@ -304,7 +346,6 @@ class TCPWriter:
                 self.wait_start = now
                 if input.meta.start <= self.first_unack and input.meta.end > self.first_unack:
                     self.first_unack = input.meta.end
-            self.logger.debug(f"first_unack={self.first_unack} buflen={len(self.buf)}")
             if self.first_unack == len(self.buf):
                 self.protocol.send_packet(Packet(PacketMeta(PacketType.FIN, 0, 0, self.seq_start)))
                 self.wait_start = now
@@ -318,8 +359,8 @@ class TCPWriter:
                 end = min(len(self.buf), start + Packet.SEGMENT_SIZE)
                 meta = PacketMeta(PacketType.DATA, start, end, self.cur_seq)
                 data = self.buf[start:end][::]
-                if len(data) < Packet.SEGMENT_SIZE:
-                    data += bytes(Packet.SEGMENT_SIZE - len(data))
+                data += bytes(Packet.SEGMENT_SIZE - len(data))
+                self.logger.debug(f"Sending bytes {data[:end-start]}")
                 self.protocol.send_packet(Packet(meta, data))
                 self.packet_sent[self.cur_seq] = cur
         elif self.state == self.State.FIN_WAIT:
@@ -333,10 +374,14 @@ class TCPWriter:
     
     def do_write(self, data: bytes) -> int:
         self.logger.info(f"Doing write of {len(data)} bytes")
-        self.buf = data
-        self.state = self.State.INIT
-        while self.state != self.State.FINISHED:
+        self.logger.debug(f"Bytes {data!r}")
+        while self.state != self.State.DEFAULT:
             sleep(PacketProtocol.STEP)
+        self.buf = data[::]
+        self.state = self.State.INIT
+        while self.state != self.State.DEFAULT:
+            sleep(PacketProtocol.STEP)
+        self.logger.info(f"Done write of {len(data)} bytes")
         return len(data)
 
 
@@ -345,10 +390,12 @@ class MyTCPProtocol(UDPBasedProtocol):
     actor: Thread
     reader: TCPReader
     writer: TCPWriter
-    logger = logging.root.getChild("TCPBase")
+    logger = logger
+    is_closed = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.logger.info(f"Opening socket {self.local_addr} <-> {self.remote_addr}")
         self.protocol = PacketProtocol(self)
         self.actor = Thread(target=self.act)
         self.reader = TCPReader(self.protocol)
@@ -356,21 +403,23 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.actor.start()
     
     def act(self) -> None:
-        self.logger.info(f"Acting started")
+        logger = self.logger.getChild("Actor")
+        logger.info(f"Acting started")
         reader_prev_state = self.reader.state
         writer_prev_state = self.writer.state 
-        self.logger.info(f"Reader state {reader_prev_state}")
-        self.logger.info(f"Writer state {writer_prev_state}")
-        while not (self.reader.state == TCPReader.State.TIME_OUT and self.writer.state == TCPWriter.State.FINISHED):
+        logger.info(f"Reader state {reader_prev_state}")
+        logger.info(f"Writer state {writer_prev_state}")
+        while not self.is_closed:
             packet = self.protocol.get_one_packet(timeout=PacketProtocol.STEP)
             self.reader.handle_input(packet)
             if self.reader.state != reader_prev_state:
-                self.logger.info(f"Reader changed state {reader_prev_state} -> {self.reader.state}")
+                logger.info(f"Reader changed state {reader_prev_state} -> {self.reader.state}")
                 reader_prev_state = self.reader.state
             self.writer.handle_input(packet)
             if self.writer.state != writer_prev_state:
-                self.logger.info(f"Writer changed state {writer_prev_state} -> {self.writer.state}")
+                logger.info(f"Writer changed state {writer_prev_state} -> {self.writer.state}")
                 writer_prev_state = self.writer.state
+        logger.info(f"Acting stopped")
 
     def send(self, data: bytes) -> int:
         self.logger.info(f"Sending {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
@@ -381,5 +430,8 @@ class MyTCPProtocol(UDPBasedProtocol):
         return self.reader.do_read(n)
     
     def close(self):
+        self.logger.info(f"Closing socket {self.local_addr} <-> {self.remote_addr}")
+        self.is_closed = True
+        self.actor.join()
         super().close()
 
