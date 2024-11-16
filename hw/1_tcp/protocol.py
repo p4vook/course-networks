@@ -92,12 +92,14 @@ class PacketProtocol:
     SYN_TIMEOUT = 0.1
     FIN_TIMEOUT = 0.1
 
+    hooks: list[Callable[[Packet], None]] = []
+
     udp: UDPBasedProtocol
 
-    def __init__(self, udp) -> None:
-        print("Initialized protocol...")
+    def __init__(self, udp: UDPBasedProtocol) -> None:
         self.udp = udp
-
+        print(f"Initialized protocol to {udp.remote_addr}...")
+    
     def receive_packet(self) -> Packet:
         packet_bytes = self.udp.recvfrom(Packet.SIZE)
         packet_meta = bytes_to_meta(packet_bytes[:PacketMeta.META_SIZE])
@@ -105,28 +107,28 @@ class PacketProtocol:
     
     def send_packet(self, packet: Packet) -> bool:
         packet_bytes = packet.meta.to_bytes() + packet.segment
-        print(f"Sending packet {packet.meta.typ, packet.meta.seq}")
+        print(f"Sending packet {packet.meta.typ, packet.meta.seq} to {self.udp.remote_addr}")
         assert len(packet_bytes) == Packet.SIZE
         return self.udp.sendto(packet_bytes) == Packet.SIZE
 
     def get_one_packet(self,
                        timeout: float | None = None) -> Packet | None:
         if timeout:
-            print(f"selecting with timeout {timeout}", flush=True)
+            print(f"selecting with timeout {timeout} from {self.udp.remote_addr}", flush=True)
             if not select([self.udp.udp_socket], [], [], timeout):
                 return None
-            print("select finished")
         return self.receive_packet()
 
     def get_packet(self, 
                    typ: list[PacketType] = [],
                    packet_filter: Callable[[Packet], bool] = lambda _: True,
                    timeout: float | None = None) -> Packet:
-        print(f"Accepted typs: {typ}")
+        exec = randint(1, 100000)
+        print(f"{exec}: Accepted typs: {typ} from {self.udp.remote_addr}")
         packet = self.get_one_packet(timeout)
-        typ_filter = lambda packet: typ is None or packet.meta.typ in typ
+        typ_filter = lambda packet: not typ or packet.meta.typ in typ
         if packet:
-            print(f"Received packet {(packet.meta.typ, packet.meta.seq)}, {typ_filter(packet)} && {packet_filter(packet)}", flush=True)
+            print(f"{exec}: Received packet {(packet.meta.typ, packet.meta.seq)}, {typ_filter(packet)} && {packet_filter(packet)} from {self.udp.remote_addr}, accepted typs: {typ}", flush=True)
         while packet and not (typ_filter(packet) and packet_filter(packet)):
             # sloppy timeout handling but hopefully it won't break us
             packet = self.get_one_packet(timeout)
@@ -194,6 +196,7 @@ class TCPWriter:
                 self.protocol.get_packet(typ=[PacketType.ACK],
                                          packet_filter=lambda packet: packet.meta.seq == self.cur_seq,
                                          timeout=self.protocol.SYN_TIMEOUT)
+                print("Got ack on SYN", flush=True)
                 break
             except TimeoutError:
                 print("Timeout", flush=True)
