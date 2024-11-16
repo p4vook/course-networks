@@ -151,8 +151,6 @@ class PacketProtocol:
 
 
 def in_seq_segment(seq: int, seq_start: int, cur_seq: int) -> bool:
-    SEQ_TOLERANCE = 10000
-    cur_seq = (cur_seq + SEQ_TOLERANCE) % 2**32
     if seq_start <= cur_seq:
         return seq_start <= seq and seq <= cur_seq
     else:
@@ -186,10 +184,11 @@ class TCPReader:
         self.protocol = protocol
     
     def valid_seq(self, seq: int) -> bool:
-        return in_seq_segment(seq, self.seq_start + 1, self.last_seq)
+        SEQ_TOLERANCE = 10000
+        return in_seq_segment(seq, self.seq_start, (self.last_seq + SEQ_TOLERANCE) % 2**32)
 
     def handle_input(self, input: Packet | None) -> None:
-        self.logger.debug(f"Handling input {input.meta if input else None}")
+        self.logger.debug(f"Handling input {input.meta if input else None} from {self.state}")
         now = datetime.now()
         if self.state == self.State.SYN_WAIT:
             if not input or input.meta.typ != PacketType.SYN:
@@ -236,6 +235,7 @@ class TCPReader:
             self.state = self.State.SYN_WAIT
 
     def do_read(self, n: int) -> bytes:
+        self.logger.info(f"Doing Read of {n} bytes")
         while self.buf_ptr + n < len(self.buf):
             sleep(PacketProtocol.STEP)
         return self.buf[self.buf_ptr:self.buf_ptr + n]
@@ -272,7 +272,7 @@ class TCPWriter:
         return in_seq_segment(seq, self.seq_start, self.cur_seq)
 
     def handle_input(self, input: Packet | None) -> None:
-        self.logger.debug(f"Handling input {input.meta if input else None}")
+        self.logger.debug(f"Handling input {input.meta if input else None} from state {self.state}")
         now = datetime.now()
         if self.state == self.State.DEFAULT:
             pass
@@ -298,13 +298,13 @@ class TCPWriter:
                 if (now - self.wait_start).microseconds > self.ACK_WAIT_US:
                     self.wait_start = now
                     self.state = self.State.INIT
-                    return
             else:
                 ack_delay = (now - self.packet_sent[input.meta.seq]).microseconds
                 self.cur_delay_us = self.protocol.delay_step(self.cur_delay_us, ack_delay)
                 self.wait_start = now
                 if input.meta.start <= self.first_unack and input.meta.end > self.first_unack:
                     self.first_unack = input.meta.end
+            self.logger.debug(f"first_unack={self.first_unack} buflen={len(self.buf)}")
             if self.first_unack == len(self.buf):
                 self.protocol.send_packet(Packet(PacketMeta(PacketType.FIN, 0, 0, self.seq_start)))
                 self.wait_start = now
@@ -317,7 +317,7 @@ class TCPWriter:
                 self.cur_seq = (self.cur_seq + 1) % 2**32
                 end = min(len(self.buf), start + Packet.SEGMENT_SIZE)
                 meta = PacketMeta(PacketType.DATA, start, end, self.cur_seq)
-                data = self.buf[start:end]
+                data = self.buf[start:end][::]
                 if len(data) < Packet.SEGMENT_SIZE:
                     data += bytes(Packet.SEGMENT_SIZE - len(data))
                 self.protocol.send_packet(Packet(meta, data))
@@ -332,6 +332,7 @@ class TCPWriter:
 
     
     def do_write(self, data: bytes) -> int:
+        self.logger.info(f"Doing write of {len(data)} bytes")
         self.buf = data
         self.state = self.State.INIT
         while self.state != self.State.FINISHED:
@@ -359,14 +360,14 @@ class MyTCPProtocol(UDPBasedProtocol):
         reader_prev_state = self.reader.state
         writer_prev_state = self.writer.state 
         self.logger.info(f"Reader state {reader_prev_state}")
-        self.logger.info(f"Writer state {reader_prev_state}")
+        self.logger.info(f"Writer state {writer_prev_state}")
         while not (self.reader.state == TCPReader.State.TIME_OUT and self.writer.state == TCPWriter.State.FINISHED):
             packet = self.protocol.get_one_packet(timeout=PacketProtocol.STEP)
             self.reader.handle_input(packet)
-            self.writer.handle_input(packet)
             if self.reader.state != reader_prev_state:
                 self.logger.info(f"Reader changed state {reader_prev_state} -> {self.reader.state}")
                 reader_prev_state = self.reader.state
+            self.writer.handle_input(packet)
             if self.writer.state != writer_prev_state:
                 self.logger.info(f"Writer changed state {writer_prev_state} -> {self.writer.state}")
                 writer_prev_state = self.writer.state
