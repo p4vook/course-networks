@@ -214,7 +214,7 @@ class TCPReader:
     seq_start = -1
     last_seq: int
     wait_start = datetime.now()
-    first_unreceived = 0
+    first_unreceived: int
     logger = logger.getChild("Reader")
 
     def __init__(self, protocol: PacketProtocol) -> None:
@@ -236,7 +236,7 @@ class TCPReader:
             self.last_seq = self.seq_start
             self.protocol.send_packet(Packet(PacketMeta(PacketType.SYNACK, 0, 0, self.seq_start)))
             self.wait_start = now
-            self.fisrt_unreceived = 0
+            self.first_unreceived = 0
             self.state = self.State.ACK_WAIT
         elif self.state == self.State.ACK_WAIT:
             if not input or input.meta.typ != PacketType.ACK or input.meta.seq != self.seq_start:
@@ -259,8 +259,8 @@ class TCPReader:
                 return
             if input.meta.start > self.first_unreceived:
                 return
-            self.logger.debug(f"Received bytes bytes {input.segment[:input.meta.end - input.meta.start]!r}")
             if self.first_unreceived < input.meta.end:
+                self.logger.debug(f"Received {input.meta.end - self.first_unreceived} new bytes")
                 self.buf += input.segment[self.first_unreceived-input.meta.start:input.meta.end][::]
                 self.first_unreceived = input.meta.end
             self.protocol.send_packet(Packet(PacketMeta(PacketType.ACK, input.meta.start, input.meta.end, input.meta.seq)))
@@ -273,13 +273,12 @@ class TCPReader:
             self.state = self.State.SYN_WAIT
 
     def do_read(self, n: int) -> bytes:
-        self.logger.info(f"Doing read of {n} bytes on {self.protocol.udp.local_addr}, {self.buf_ptr}")
+        self.logger.info(f"Doing read of {n} bytes on {self.protocol.udp.local_addr}")
         while self.buf_ptr + n > len(self.buf):
             sleep(PacketProtocol.STEP)
         self.logger.info(f"Done read of {n} bytes on {self.protocol.udp.local_addr}") 
         res = self.buf[self.buf_ptr:self.buf_ptr + n][::]
         self.buf_ptr += n
-        self.logger.debug(f"Bytes {res!r}")
         return res
 
 
@@ -360,7 +359,7 @@ class TCPWriter:
                 meta = PacketMeta(PacketType.DATA, start, end, self.cur_seq)
                 data = self.buf[start:end][::]
                 data += bytes(Packet.SEGMENT_SIZE - len(data))
-                self.logger.debug(f"Sending bytes {data[:end-start]}")
+                self.logger.debug(f"Sending {end - start} bytes")
                 self.protocol.send_packet(Packet(meta, data))
                 self.packet_sent[self.cur_seq] = cur
         elif self.state == self.State.FIN_WAIT:
@@ -373,15 +372,14 @@ class TCPWriter:
 
     
     def do_write(self, data: bytes) -> int:
-        self.logger.info(f"Doing write of {len(data)} bytes")
-        self.logger.debug(f"Bytes {data!r}")
+        self.logger.info(f"Doing write of {len(data)} bytes {self.protocol.udp.local_addr} -> {self.protocol.udp.remote_addr}")
         while self.state != self.State.DEFAULT:
             sleep(PacketProtocol.STEP)
         self.buf = data[::]
         self.state = self.State.INIT
         while self.state != self.State.DEFAULT:
             sleep(PacketProtocol.STEP)
-        self.logger.info(f"Done write of {len(data)} bytes")
+        self.logger.info(f"Done write of {len(data)} bytes {self.protocol.udp.local_addr} -> {self.protocol.udp.remote_addr}")
         return len(data)
 
 

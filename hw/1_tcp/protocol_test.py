@@ -56,7 +56,6 @@ def setup_netem(packet_loss, duplicate, reorder):
     netem_cmd += " delay 10ms rate 1Mbit"
     os.system(netem_cmd)
 
-run_test(EchoClient, EchoServer, iterations=2, msg_size=11)
 
 @pytest.mark.parametrize("iterations", [10, 50, 100])
 @pytest.mark.timeout(30)
