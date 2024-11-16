@@ -6,3 +6,5 @@ services:
       context: .
       dockerfile: Dockerfile
     privileged: true
+    volumes:
+      - logs:/var/log/app:rw

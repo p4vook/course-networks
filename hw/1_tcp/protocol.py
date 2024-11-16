@@ -5,19 +5,29 @@ from threading import Thread
 from datetime import datetime
 from select import select
 from typing import Callable
+import logging
 
+logging.basicConfig(filename=f"/var/log/app/tcp-{datetime.now().isoformat()}.log", level=logging.DEBUG)
 
 class UDPBasedProtocol:
     def __init__(self, *, local_addr, remote_addr) -> None:
         self.udp_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
+        self.local_addr = local_addr
         self.remote_addr = remote_addr
         self.udp_socket.bind(local_addr)
+        self.logger = logging.Logger("UDP")
+        self.logger.info(f"Initialized socket {self.local_addr} <-> {self.remote_addr}")
 
     def sendto(self, data) -> int:
-        return self.udp_socket.sendto(data, self.remote_addr)
+        self.logger.debug(f"Sending {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
+        res = self.udp_socket.sendto(data, self.remote_addr)
+        self.logger.debug(f"Sent {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
+        return res
 
     def recvfrom(self, n) -> bytes:
+        self.logger.debug(f"Receiving {n} bytes on {self.local_addr}")
         msg, addr = self.udp_socket.recvfrom(n)
+        self.logger.debug(f"Received {len(msg)} bytes {addr} -> {self.local_addr}")
         return msg
 
     def close(self) -> None:
@@ -64,7 +74,7 @@ class PacketMeta:
 
 
 def bytes_to_meta(byte_meta: bytes) -> PacketMeta:
-    assert len(byte_meta) >= PacketMeta.META_SIZE
+    assert len(byte_meta) == PacketMeta.META_SIZE
     typ = bytes_to_number(byte_meta[:4])
     seq = bytes_to_number(byte_meta[4:8])
     start = bytes_to_number(byte_meta[8:16])
@@ -74,13 +84,15 @@ def bytes_to_meta(byte_meta: bytes) -> PacketMeta:
 
 class Packet:
     SEGMENT_SIZE = 4000
-    SIZE = PacketMeta.META_SIZE + SEGMENT_SIZE
 
     meta: PacketMeta
     segment: bytes
 
-    def __init__(self, meta: PacketMeta, segment: bytes = bytes(SEGMENT_SIZE)) -> None:
-        assert len(segment) == self.SEGMENT_SIZE
+    def __init__(self, meta: PacketMeta, segment: bytes = bytes()) -> None:
+        if meta.typ == PacketType.DATA:
+            assert len(segment) == self.SEGMENT_SIZE
+        else: 
+            assert len(segment) == 0
         self.meta = meta
         self.segment = segment
 
@@ -92,50 +104,39 @@ class PacketProtocol:
     SYN_TIMEOUT = 0.1
     FIN_TIMEOUT = 0.1
 
+    logger = logging.Logger("PacketProtocol")
     hooks: list[Callable[[Packet], None]] = []
 
     udp: UDPBasedProtocol
 
     def __init__(self, udp: UDPBasedProtocol) -> None:
         self.udp = udp
-        print(f"Initialized protocol to {udp.remote_addr}...")
+        self.logger.info(f"Initialized protocol {udp.local_addr} -> {udp.remote_addr}")
     
     def receive_packet(self) -> Packet:
-        packet_bytes = self.udp.recvfrom(Packet.SIZE)
-        packet_meta = bytes_to_meta(packet_bytes[:PacketMeta.META_SIZE])
-        return Packet(packet_meta, packet_bytes[PacketMeta.META_SIZE:])
+        meta_bytes = self.udp.recvfrom(PacketMeta.META_SIZE)
+        packet_meta = bytes_to_meta(meta_bytes)
+        segment_bytes = bytes()
+        if packet_meta.typ == PacketType.DATA:
+            segment_bytes = self.udp.recvfrom(Packet.SEGMENT_SIZE)
+        res = Packet(packet_meta, segment_bytes)
+        self.logger.debug(f"Received packet {packet_meta} with length {len(segment_bytes)}")
+        return res
     
     def send_packet(self, packet: Packet) -> bool:
         packet_bytes = packet.meta.to_bytes() + packet.segment
-        print(f"Sending packet {packet.meta.typ, packet.meta.seq} to {self.udp.remote_addr}")
-        assert len(packet_bytes) == Packet.SIZE
-        return self.udp.sendto(packet_bytes) == Packet.SIZE
-
-    def get_one_packet(self,
-                       timeout: float | None = None) -> Packet | None:
+        self.logger.debug(f"Sending packet {packet.meta} with length {len(packet.segment)}")
+        return self.udp.sendto(packet_bytes) == len(packet_bytes)
+    
+    def get_one_packet(self, timeout: float | None = None):
         if timeout:
-            print(f"selecting with timeout {timeout} from {self.udp.remote_addr}", flush=True)
-            if not select([self.udp.udp_socket], [], [], timeout):
+            self.logger.debug(f"Selecting for packet with timeout {timeout}")
+            readable, _, _ = select([self.udp.udp_socket], [], [], timeout)
+            self.logger.debug(f"Select finished, result {readable != []}")
+            if not readable:
                 return None
         return self.receive_packet()
-
-    def get_packet(self, 
-                   typ: list[PacketType] = [],
-                   packet_filter: Callable[[Packet], bool] = lambda _: True,
-                   timeout: float | None = None) -> Packet:
-        exec = randint(1, 100000)
-        print(f"{exec}: Accepted typs: {typ} from {self.udp.remote_addr}")
-        packet = self.get_one_packet(timeout)
-        typ_filter = lambda packet: not typ or packet.meta.typ in typ
-        if packet:
-            print(f"{exec}: Received packet {(packet.meta.typ, packet.meta.seq)}, {typ_filter(packet)} && {packet_filter(packet)} from {self.udp.remote_addr}, accepted typs: {typ}", flush=True)
-        while packet and not (typ_filter(packet) and packet_filter(packet)):
-            # sloppy timeout handling but hopefully it won't break us
-            packet = self.get_one_packet(timeout)
-        if not packet:
-            raise TimeoutError("Timeout waiting for packet")
-        return packet
-
+    
     def delay_step(self, previous_delay: int, current_delay: int) -> int:
         return (previous_delay * 4 + current_delay) // 5
 
@@ -172,49 +173,6 @@ class TCPReader:
         self.reader_thread.join()
         assert self.buf_ptr + n <= len(self.buf)
         return self.buf[self.buf_ptr:self.buf_ptr + n]
-
-
-class TCPWriter:
-    protocol: PacketProtocol
-    seq_start: int
-    cur_seq: int
-    packet_sent_ts: dict[int, datetime]
-    cur_delay_us: int = PacketProtocol.DEFAULT_DELAY_US
-
-    def __init__(self, protocol: PacketProtocol) -> None:
-        self.protocol = protocol
-        self.seq_start = randint(0, 2**32 - 1)
-        self.cur_seq = self.seq_start
-
-    def write(self, buf: bytes) -> int:
-        n = len(buf)
-        while True:
-            meta = PacketMeta(PacketType.SYN, 0, 0, self.cur_seq)
-            self.protocol.send_packet(Packet(meta))
-            print("Waiting for ack on SYN", flush=True)
-            try: 
-                self.protocol.get_packet(typ=[PacketType.ACK],
-                                         packet_filter=lambda packet: packet.meta.seq == self.cur_seq,
-                                         timeout=self.protocol.SYN_TIMEOUT)
-                print("Got ack on SYN", flush=True)
-                break
-            except TimeoutError:
-                print("Timeout", flush=True)
-                pass
-        first_unack = 0
-        while first_unack < n:
-            iteration_start = datetime.now()
-            for segment_start in range(first_unack, n, Packet.SEGMENT_SIZE):
-                now = datetime.now()
-                if (now - iteration_start).microseconds > 2 * self.cur_delay_us:
-                    break
-                segment_end = min(segment_start + Packet.SEGMENT_SIZE, n)
-                self.cur_seq = (self.cur_seq + 1) % 2**32
-                meta = PacketMeta(PacketType.DATA, segment_start, segment_end, self.cur_seq)
-                packet_bytes = buf[segment_start:segment_end]
-                packet_bytes += bytes(Packet.SEGMENT_SIZE - len(packet_bytes))
-                self.protocol.send_packet(Packet(meta, packet_bytes))
-        return n
 
 class MyTCPProtocol(UDPBasedProtocol):
     protocol: PacketProtocol
