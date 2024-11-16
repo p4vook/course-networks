@@ -7,4 +7,6 @@ services:
       dockerfile: Dockerfile
     privileged: true
     volumes:
-      - logs:/var/log/app:rw
+      - type: bind
+        source: logs
+        target: /app/logs
