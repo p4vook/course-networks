@@ -8,27 +8,30 @@ from typing import Callable
 from time import sleep
 import logging
 
-logging.basicConfig(filename=f"logs/tcp-{datetime.now().isoformat()}.log", level=logging.INFO)
+logging.basicConfig(filename=f"logs/tcp-{datetime.now().isoformat()}.log",
+                    level=logging.DEBUG, 
+                    format="%(asctime)s\t%(levelname)s\t%(name)s\t%(message)s")
 
 class UDPBasedProtocol:
+    udp_logger = logging.root.getChild("UDPBase")
+
     def __init__(self, *, local_addr, remote_addr) -> None:
         self.udp_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
         self.local_addr = local_addr
         self.remote_addr = remote_addr
         self.udp_socket.bind(local_addr)
-        self.logger = logging.root.getChild("UDP")
-        self.logger.info(f"Initialized socket {self.local_addr} <-> {self.remote_addr}")
+        self.udp_logger.info(f"Initialized socket {self.local_addr} <-> {self.remote_addr}")
 
     def sendto(self, data) -> int:
-        self.logger.debug(f"Sending {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
+        self.udp_logger.debug(f"Sending {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
         res = self.udp_socket.sendto(data, self.remote_addr)
-        self.logger.debug(f"Sent {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
+        self.udp_logger.debug(f"Sent {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
         return res
 
     def recvfrom(self, n) -> bytes:
-        self.logger.debug(f"Receiving {n} bytes on {self.local_addr}")
+        self.udp_logger.debug(f"Receiving {n} bytes on {self.local_addr}")
         msg, addr = self.udp_socket.recvfrom(n)
-        self.logger.debug(f"Received {len(msg)} bytes {addr} -> {self.local_addr}")
+        self.udp_logger.debug(f"Received {len(msg)} bytes {addr} -> {self.local_addr}")
         return msg
 
     def close(self) -> None:
@@ -110,7 +113,7 @@ class PacketProtocol:
     FIN_TIMEOUT = 0.1
     STEP = 0.001
 
-    logger = logging.root.getChild("PacketProtocol")
+    logger = logging.root.getChild("Proto")
     hooks: list[Callable[[Packet], None]] = []
 
     udp: UDPBasedProtocol
@@ -177,14 +180,16 @@ class TCPReader:
     last_seq: int
     wait_start = datetime.now()
     first_unreceived = 0
+    logger = logging.root.getChild("Reader")
 
     def __init__(self, protocol: PacketProtocol) -> None:
         self.protocol = protocol
     
     def valid_seq(self, seq: int) -> bool:
-        return in_seq_segment(seq, self.seq_start, self.last_seq)
+        return in_seq_segment(seq, self.seq_start + 1, self.last_seq)
 
     def handle_input(self, input: Packet | None) -> None:
+        self.logger.debug(f"Handling input {input.meta if input else None}")
         now = datetime.now()
         if self.state == self.State.SYN_WAIT:
             if not input or input.meta.typ != PacketType.SYN:
@@ -258,6 +263,7 @@ class TCPWriter:
     cur_delay_us: int = PacketProtocol.DEFAULT_DELAY_US
     packet_sent: dict[int, datetime]
     protocol: PacketProtocol
+    logger = logging.root.getChild("Writer")
 
     def __init__(self, protocol: PacketProtocol) -> None:
         self.protocol = protocol
@@ -266,6 +272,7 @@ class TCPWriter:
         return in_seq_segment(seq, self.seq_start, self.cur_seq)
 
     def handle_input(self, input: Packet | None) -> None:
+        self.logger.debug(f"Handling input {input.meta if input else None}")
         now = datetime.now()
         if self.state == self.State.DEFAULT:
             pass
@@ -337,7 +344,7 @@ class MyTCPProtocol(UDPBasedProtocol):
     actor: Thread
     reader: TCPReader
     writer: TCPWriter
-    logger: logging.Logger
+    logger = logging.root.getChild("TCPBase")
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -345,7 +352,6 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.actor = Thread(target=self.act)
         self.reader = TCPReader(self.protocol)
         self.writer = TCPWriter(self.protocol)
-        self.logger = logging.root.getChild("TCP")
         self.actor.start()
     
     def act(self) -> None:
