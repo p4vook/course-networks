@@ -5,6 +5,7 @@ from threading import Thread
 from datetime import datetime
 from select import select
 from typing import Callable
+from time import sleep
 import logging
 
 logging.basicConfig(filename=f"/var/log/app/tcp-{datetime.now().isoformat()}.log", level=logging.DEBUG)
@@ -45,8 +46,9 @@ def bytes_to_number(num_bytes: bytes) -> int:
 class PacketType(Enum):
     DATA = 1
     SYN = 2
-    ACK = 3
-    FIN = 4
+    SYNACK = 3
+    ACK = 4
+    FIN = 5
 
 
 class PacketMeta:
@@ -63,7 +65,7 @@ class PacketMeta:
         self.end = end
         self.seq = seq
     
-    def __iter__(self):
+    def __iter__(self) -> iter:
         return iter((self.typ, self.start, self.end, self.seq))
 
     def to_bytes(self) -> bytes:
@@ -96,13 +98,14 @@ class Packet:
         self.meta = meta
         self.segment = segment
 
-    def __iter__(self):
+    def __iter__(self) -> iter:
         return iter((self.meta, self.segment))
 
 class PacketProtocol:
     DEFAULT_DELAY_US = 2000
     SYN_TIMEOUT = 0.1
     FIN_TIMEOUT = 0.1
+    STEP = 0.001
 
     logger = logging.Logger("PacketProtocol")
     hooks: list[Callable[[Packet], None]] = []
@@ -141,55 +144,144 @@ class PacketProtocol:
         return (previous_delay * 4 + current_delay) // 5
 
 
+def in_seq_segment(seq: int, seq_start: int, cur_seq: int) -> bool:
+    SEQ_TOLERANCE = 10000
+    cur_seq = (cur_seq + SEQ_TOLERANCE) & ((1 << 32) - 1)
+    if seq_start <= cur_seq:
+        return seq_start <= seq and seq <= cur_seq
+    else:
+        return seq_start <= seq or seq <= cur_seq
+
+
 class TCPReader:
+    class State(Enum):
+        SYN_WAIT = 10
+        ACK_WAIT = 20
+        ESTABLISHED = 30
+        FIN_WAIT = 40
+        TIME_OUT = 50
+
+    SYN_WAIT_US = 20*10**6
+    ACK_WAIT_US = 100*10**3
+    ESTABLISHED_WAIT_US = 3*10**6
+    FIN_WAIT_US = 100*10**3
+
     protocol: PacketProtocol
-    buf = bytes()
-    reader_thread: Thread
+    state: State = State.SYN_WAIT
+    buf: bytes = bytes()
     buf_ptr = 0
+    seq_start = 0
+    last_seq = 0
+    wait_start: datetime = datetime.now()
+    first_unreceived = 0
 
     def __init__(self, protocol: PacketProtocol) -> None:
         self.protocol = protocol
-        self.reader_thread = Thread(target=self.read_to_buf)
-        self.reader_thread.start()
     
-    # Reads bytes into buf.
-    def read_to_buf(self) -> None:
-        meta, segment = self.protocol.get_packet(typ = [PacketType.SYN])
-        while meta.typ != PacketType.FIN:
-            first_unreceived = 0
-            if meta.start > first_unreceived:
-                continue
-            if meta.end > first_unreceived:
-                MS = PacketMeta.META_SIZE
-                self.buf += segment[MS + (first_unreceived - meta.start):MS + meta.end]
-                first_unreceived = meta.end
-            response_meta = meta
-            response_meta.typ = PacketType.ACK
-            self.protocol.send_packet(Packet(response_meta))
-            meta, segment = self.protocol.get_packet(typ=[PacketType.DATA, PacketType.FIN])
-        self.protocol.send_packet(Packet(meta))
-    
-    def read(self, n: int) -> bytes:
-        self.reader_thread.join()
-        assert self.buf_ptr + n <= len(self.buf)
+    def valid_seq(self, seq: int) -> bool:
+        return in_seq_segment(seq, self.seq_start, self.last_seq)
+
+    def handle_input(self, input: Packet | None) -> None:
+        now = datetime.now()
+        if self.state == self.State.SYN_WAIT:
+            if not input or input.meta.typ != PacketType.SYN:
+                if (now - self.wait_start).microseconds > self.SYN_WAIT_US:
+                    self.state = self.State.TIME_OUT
+                return
+            self.seq_start = input.meta.seq
+            self.last_seq = self.seq_start
+            self.protocol.send_packet(Packet(PacketMeta(PacketType.SYNACK, 0, 0, self.seq_start)))
+            self.wait_start = now
+            self.fisrt_unreceived = 0
+            self.state = self.State.ACK_WAIT
+        elif self.state == self.State.ACK_WAIT:
+            if not input or input.meta.typ != PacketType.ACK or input.meta.seq != self.seq_start:
+                if (now - self.wait_start).microseconds > self.ACK_WAIT_US:
+                    self.state = self.State.SYN_WAIT
+                return 
+            self.wait_start = now
+            self.state = self.State.ESTABLISHED
+        elif self.state == self.State.ESTABLISHED:
+            if not input \
+               or not (input.meta.typ == PacketType.DATA and self.valid_seq(input.meta.seq)) \
+               or not (input.meta.typ == PacketType.FIN and input.meta.seq == self.seq_start):
+                if (now - self.wait_start).microseconds > self.ACK_WAIT_US:
+                    self.state = self.State.SYN_WAIT
+                return
+            self.wait_start = now
+            if input.meta.typ == PacketType.FIN:
+                self.protocol.send_packet(Packet(PacketMeta(PacketType.FIN, 0, 0, self.seq_start)))
+                self.state = self.State.ACK_WAIT
+            if input.meta.start > self.first_unreceived:
+                return
+            if self.first_unreceived < input.meta.end:
+                self.buf += input.segment[self.first_unreceived-input.meta.start:input.meta.end]
+                self.first_unreceived = input.meta.end
+            self.protocol.send_packet(Packet(PacketMeta(PacketType.ACK, input.meta.start, input.meta.end, input.meta.seq)))
+        elif self.state == self.State.ACK_WAIT:
+            if not input or not (input.meta.typ == PacketType.ACK and input.meta.seq == self.seq_start):
+                if (now - self.wait_start).microseconds() > self.ACK_WAIT_US:
+                    self.wait_start = now
+                    self.state = self.State.ESTABLISHED
+                return
+            self.wait_start = now
+            self.state = self.State.SYN_WAIT
+
+    def do_read(self, n: int) -> bytes:
+        while self.buf_ptr + n < len(self.buf):
+            sleep(PacketProtocol.STEP)
         return self.buf[self.buf_ptr:self.buf_ptr + n]
+
+
+class TCPWriter:
+    class State(Enum):
+        DEFAULT = 00
+        INIT = 10
+        SYNACK_WAIT = 20
+        ESTABLISHED = 30
+        FIN_WAIT = 40
+        FINISHED = 50
+    
+    state: State = State.DEFAULT
+    protocol: PacketProtocol
+
+    def __init__(self, protocol: PacketProtocol) -> None:
+        self.protocol = protocol
+
+    def handle_input(self, input: Packet | None) -> None:
+        pass 
+    
+    def do_write(self, data: bytes) -> int:
+        self.state = self.State.INIT
+        while self.state != self.State.FINISHED:
+            sleep(PacketProtocol.STEP)
+        return len(data)
+
 
 class MyTCPProtocol(UDPBasedProtocol):
     protocol: PacketProtocol
+    actor: Thread
     reader: TCPReader
     writer: TCPWriter
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.protocol = PacketProtocol(self)
+        self.actor = Thread(target=self.act)
         self.reader = TCPReader(self.protocol)
         self.writer = TCPWriter(self.protocol)
+    
+    def act(self):
+        while not (self.reader.state == TCPReader.State.TIME_OUT and self.writer.state == TCPWriter.State.FINISHED):
+            packet = self.protocol.get_one_packet(timeout=PacketProtocol.STEP)
+            self.reader.handle_input(packet)
+            self.writer.handle_input(packet)
 
     def send(self, data: bytes) -> int:
-        return self.writer.write(data)
+        return self.writer.do_write(data)
 
     def recv(self, n: int) -> bytes:
-        return self.reader.read(n)
+        return self.reader.do_read(n)
     
     def close(self):
         super().close()
