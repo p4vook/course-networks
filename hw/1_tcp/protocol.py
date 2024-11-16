@@ -36,7 +36,7 @@ logging.config.dictConfig(
         },
         "loggers": {
             "tcp": {
-                "handlers": ["debug_file", "regular_file"],
+                "handlers": ["regular_file", "debug_file"],
             },
         },
     }
@@ -202,10 +202,10 @@ class TCPReader:
         TIME_OUT = 50
 
     SYN_WAIT_US = 20*10**6
-    DATA_WAIT_US = 500*10**3
+    DATA_WAIT_US = 10**6
     ESTABLISHED_WAIT_US = 3*10**6
-    FIN_WAIT_US = 500*10**3
-    ACK_WAIT_US = 500*10**3
+    FIN_WAIT_US = 10**6
+    ACK_WAIT_US = 10**6
 
     protocol: PacketProtocol
     state = State.SYN_WAIT
@@ -215,6 +215,7 @@ class TCPReader:
     last_seq: int
     wait_start = datetime.now()
     first_unreceived: int
+    data_available: bool = False
     logger = logger.getChild("Reader")
 
     def __init__(self, protocol: PacketProtocol) -> None:
@@ -270,12 +271,14 @@ class TCPReader:
                     self.state = self.State.ESTABLISHED
                 return
             self.wait_start = now
+            self.data_available = True
             self.state = self.State.SYN_WAIT
 
     def do_read(self, n: int) -> bytes:
         self.logger.info(f"Doing read of {n} bytes on {self.protocol.udp.local_addr}")
-        while self.buf_ptr + n > len(self.buf):
+        while not self.data_available or self.buf_ptr + n > len(self.buf):
             sleep(PacketProtocol.STEP)
+        self.data_available = False
         self.logger.info(f"Done read of {n} bytes on {self.protocol.udp.local_addr}") 
         res = self.buf[self.buf_ptr:self.buf_ptr + n][::]
         self.buf_ptr += n
@@ -291,9 +294,9 @@ class TCPWriter:
         FIN_WAIT = 40
         FINISHED = 50
     
-    SYNACK_WAIT_US = 500 * 10**3
-    ACK_WAIT_US = 5000 * 10**3
-    FIN_WAIT_US = 500 * 10**3
+    SYNACK_WAIT_US = 10**6
+    ACK_WAIT_US = 5*10**6
+    FIN_WAIT_US = 10**6
     
     state: State = State.DEFAULT
     buf: bytes = bytes()
@@ -362,6 +365,10 @@ class TCPWriter:
                 self.logger.debug(f"Sending {end - start} bytes")
                 self.protocol.send_packet(Packet(meta, data))
                 self.packet_sent[self.cur_seq] = cur
+            cur = datetime.now()
+            delta = 2 * self.cur_delay_us - (cur - now).microseconds 
+            if delta > 0:
+                sleep(delta / 10**6)
         elif self.state == self.State.FIN_WAIT:
             if input is None or not (input.meta.typ == PacketType.FIN and input.meta.seq == self.seq_start):
                 if (now - self.wait_start).microseconds > self.FIN_WAIT_US:
