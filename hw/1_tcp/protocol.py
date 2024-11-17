@@ -43,7 +43,7 @@ logging.config.dictConfig(
 )
 
 logger = logging.getLogger("tcp")
-#logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO)
 
 class UDPBasedProtocol:
     udp_logger = logger.getChild("UDPBase")
@@ -144,9 +144,7 @@ class Packet:
         return iter((self.meta, self.segment))
 
 class PacketProtocol:
-    DEFAULT_DELAY = 2.0
-    SYN_TIMEOUT = 0.1
-    FIN_TIMEOUT = 0.1
+    DEFAULT_DELAY = 0.02
     STEP = 0.001
 
     logger = logger.getChild("Proto")
@@ -213,13 +211,14 @@ class TCPReader:
     buf_ptr = 0
     seq_start = -1
     last_seq: int
-    wait_start = datetime.now()
+    wait_start: datetime
     first_unreceived: int = 0
     is_finished: bool = False
     logger = logger.getChild("Reader")
 
     def __init__(self, protocol: PacketProtocol) -> None:
         self.protocol = protocol
+        self.wait_start = datetime.now()
     
     def valid_seq(self, seq: int) -> bool:
         SEQ_TOLERANCE = 10000
@@ -297,9 +296,9 @@ class TCPWriter:
         FIN_WAIT = 40
         FINISHED = 50
     
-    SYNACK_WAIT_S = 3.0
-    ACK_WAIT_S = 10.0
-    FIN_WAIT_S = 3.0
+    SYNACK_WAIT_S = 2.0
+    ACK_WAIT_S = 5.0
+    FIN_WAIT_S = 2.0
     
     state: State = State.INIT
     buf: bytes = bytes()
@@ -406,6 +405,9 @@ class MyTCPProtocol(UDPBasedProtocol):
     writer: TCPWriter
     logger = logger
     is_closed = False
+    closed_time: datetime
+
+    CLOSE_WAIT_S = 3.0
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -427,6 +429,8 @@ class MyTCPProtocol(UDPBasedProtocol):
             if self.is_closed:
                 self.writer.is_finished = True
                 self.reader.is_finished = True
+                if (datetime.now() - self.closed_time).total_seconds() > self.CLOSE_WAIT_S:
+                    break
             packet = self.protocol.get_one_packet(timeout=PacketProtocol.STEP)
             self.reader.handle_input(packet)
             if self.reader.state != reader_prev_state:
@@ -448,6 +452,7 @@ class MyTCPProtocol(UDPBasedProtocol):
     
     def close(self):
         self.logger.info(f"Closing socket {self.local_addr} <-> {self.remote_addr}")
+        self.closed_time = datetime.now()
         self.is_closed = True
         self.actor.join()
         super().close()
