@@ -43,7 +43,7 @@ logging.config.dictConfig(
 )
 
 logger = logging.getLogger("tcp")
-logger.setLevel(logging.DEBUG)
+#logger.setLevel(logging.INFO)
 
 class UDPBasedProtocol:
     udp_logger = logger.getChild("UDPBase")
@@ -86,7 +86,6 @@ class PacketType(Enum):
     SYNACK = 3
     ACK = 4
     FIN = 5
-    RST = 6
 
 
 class PacketMeta:
@@ -126,7 +125,7 @@ def bytes_to_meta(byte_meta: bytes) -> PacketMeta:
 
 
 class Packet:
-    SEGMENT_SIZE = 100
+    SEGMENT_SIZE = 4000
     PACKET_SIZE = PacketMeta.META_SIZE + SEGMENT_SIZE
 
     meta: PacketMeta
@@ -145,7 +144,7 @@ class Packet:
         return iter((self.meta, self.segment))
 
 class PacketProtocol:
-    DEFAULT_DELAY_US = 2000
+    DEFAULT_DELAY = 2.0
     SYN_TIMEOUT = 0.1
     FIN_TIMEOUT = 0.1
     STEP = 0.001
@@ -183,8 +182,8 @@ class PacketProtocol:
                 return None
         return self.receive_packet()
     
-    def delay_step(self, previous_delay: int, current_delay: int) -> int:
-        return (previous_delay * 4 + current_delay) // 5
+    def delay_step(self, previous_delay: float, current_delay: float) -> float:
+        return (previous_delay * 4 + current_delay) / 5
 
 
 def in_seq_segment(seq: int, seq_start: int, cur_seq: int) -> bool:
@@ -203,11 +202,10 @@ class TCPReader:
         TIME_OUT = 50
         FINISHED = 60
 
-    SYN_WAIT_US = 20*10**6
-    DATA_WAIT_US = 10**6
-    ESTABLISHED_WAIT_US = 3*10**6
-    FIN_WAIT_US = 10**6
-    ACK_WAIT_US = 10**6
+    SYN_WAIT_S = 30.0
+    ACK_WAIT_S = 3.0
+    DATA_WAIT_S = 10.0
+    FIN_WAIT_S = 3.0
 
     protocol: PacketProtocol
     state = State.SYN_WAIT
@@ -216,7 +214,7 @@ class TCPReader:
     seq_start = -1
     last_seq: int
     wait_start = datetime.now()
-    first_unreceived: int
+    first_unreceived: int = 0
     is_finished: bool = False
     logger = logger.getChild("Reader")
 
@@ -228,37 +226,37 @@ class TCPReader:
         return in_seq_segment(seq, self.seq_start, (self.last_seq + SEQ_TOLERANCE) % 2**32)
 
     def handle_input(self, input: Packet | None) -> None:
-        self.logger.debug(f"Handling input {input.meta if input else None} from {self.state}, seq={self.seq_start}")
         now = datetime.now()
+        self.logger.debug(f"Handling input {input.meta if input else None} from {self.state}, seq={self.seq_start}")
         if self.state == self.State.SYN_WAIT:
             if not input or input.meta.typ != PacketType.SYN:
-                if (now - self.wait_start).microseconds > self.SYN_WAIT_US:
+                if (now - self.wait_start).total_seconds() > self.SYN_WAIT_S:
                     self.state = self.State.TIME_OUT
                 return
             self.seq_start = input.meta.seq
             self.last_seq = self.seq_start
             self.protocol.send_packet(Packet(PacketMeta(PacketType.SYNACK, 0, 0, self.seq_start)))
             self.wait_start = now
+            self.buf = bytes()
             self.first_unreceived = 0
             self.state = self.State.ACK_WAIT
         elif self.state == self.State.ACK_WAIT:
-            if not input or input.meta.typ != PacketType.ACK or input.meta.seq != self.seq_start:
-                if (now - self.wait_start).microseconds > self.DATA_WAIT_US:
+            if not input or not (input.meta.typ == PacketType.ACK and input.meta.seq == self.seq_start):
+                if (now - self.wait_start).total_seconds() > self.ACK_WAIT_S:
                     self.state = self.State.SYN_WAIT
                 return 
             self.wait_start = now
             self.state = self.State.ESTABLISHED
         elif self.state == self.State.ESTABLISHED:
             if not input or \
-               (not (input.meta.typ == PacketType.DATA and self.valid_seq(input.meta.seq)) and \
-                not (input.meta.typ == PacketType.FIN and input.meta.seq == self.seq_start) and \
-                not self.is_finished):
-                if (now - self.wait_start).microseconds > self.DATA_WAIT_US:
+               not ((input.meta.typ == PacketType.DATA and self.valid_seq(input.meta.seq)) or
+                    (input.meta.typ == PacketType.FIN and input.meta.seq == self.seq_start) or
+                     self.is_finished):
+                if (now - self.wait_start).total_seconds() > self.DATA_WAIT_S:
+                    self.wait_start = now
                     self.state = self.State.SYN_WAIT
                 return
             self.wait_start = now
-            if self.is_finished:
-                self.protocol.send_packet(Packet(PacketMeta(PacketType.RST, 0, 0, self.seq_start)))
             if input.meta.typ == PacketType.FIN:
                 self.protocol.send_packet(Packet(PacketMeta(PacketType.FIN, 0, 0, self.seq_start)))
                 self.state = self.State.FIN_WAIT
@@ -267,12 +265,15 @@ class TCPReader:
                 return
             if self.first_unreceived < input.meta.end:
                 self.logger.debug(f"Received {input.meta.end - self.first_unreceived} new bytes")
-                self.buf += input.segment[self.first_unreceived-input.meta.start:input.meta.end][::]
+                input_start = self.first_unreceived - input.meta.start
+                input_end = input.meta.end - input.meta.start
+                self.buf += input.segment[input_start:input_end][::]
                 self.first_unreceived = input.meta.end
+                assert len(self.buf) == self.first_unreceived
             self.protocol.send_packet(Packet(PacketMeta(PacketType.ACK, input.meta.start, input.meta.end, input.meta.seq)))
         elif self.state == self.State.FIN_WAIT:
             if not input or not (input.meta.typ == PacketType.ACK and input.meta.seq == self.seq_start):
-                if (now - self.wait_start).microseconds > self.ACK_WAIT_US:
+                if (now - self.wait_start).total_seconds() > self.FIN_WAIT_S:
                     self.state = self.State.ESTABLISHED
                 return
             self.wait_start = now
@@ -280,7 +281,7 @@ class TCPReader:
 
     def do_read(self, n: int) -> bytes:
         self.logger.info(f"Doing read of {n} bytes on {self.protocol.udp.local_addr}")
-        while self.buf_ptr + n <= len(self.buf):
+        while self.buf_ptr + n > self.first_unreceived:
             sleep(PacketProtocol.STEP)
         self.logger.info(f"Done read of {n} bytes on {self.protocol.udp.local_addr}") 
         res = self.buf[self.buf_ptr:self.buf_ptr + n][::]
@@ -296,17 +297,18 @@ class TCPWriter:
         FIN_WAIT = 40
         FINISHED = 50
     
-    SYNACK_WAIT_US = 10**6
-    ACK_WAIT_US = 5*10**6
-    FIN_WAIT_US = 10**6
+    SYNACK_WAIT_S = 3.0
+    ACK_WAIT_S = 10.0
+    FIN_WAIT_S = 3.0
     
     state: State = State.INIT
     buf: bytes = bytes()
     wait_start = datetime.now()
+    last_sent = datetime.now()
     seq_start = -1
     cur_seq: int
-    first_unack: int
-    cur_delay_us: int = PacketProtocol.DEFAULT_DELAY_US
+    first_unack: int = -1
+    cur_delay: float = PacketProtocol.DEFAULT_DELAY
     packet_sent: dict[int, datetime]
     protocol: PacketProtocol
     is_finished: bool = False
@@ -319,8 +321,8 @@ class TCPWriter:
         return in_seq_segment(seq, self.seq_start, self.cur_seq)
 
     def handle_input(self, input: Packet | None) -> None:
-        self.logger.debug(f"Handling input {input.meta if input else None} from {self.state}, seq={self.seq_start}")
         now = datetime.now()
+        self.logger.debug(f"Handling input {input.meta if input else None} from {self.state}, seq={self.seq_start}")
         if self.state == self.State.INIT:
             self.wait_start = now
             self.seq_start = randint(0, 2**32 - 1)
@@ -328,7 +330,7 @@ class TCPWriter:
             self.state = self.State.SYNACK_WAIT
         elif self.state == self.State.SYNACK_WAIT:
             if input is None or (input.meta.typ != PacketType.SYNACK):
-                if (now - self.wait_start).microseconds > self.SYNACK_WAIT_US:
+                if (now - self.wait_start).total_seconds() > self.SYNACK_WAIT_S:
                     self.wait_start = now
                     self.state = self.State.INIT
                 return
@@ -339,24 +341,34 @@ class TCPWriter:
             self.packet_sent = dict()
             self.state = self.State.ESTABLISHED
         elif self.state == self.State.ESTABLISHED:
-            if input is None or not (input.meta.typ == PacketType.ACK and self.valid_seq(input.meta.seq)):
-                if (now - self.wait_start).microseconds > self.ACK_WAIT_US:
+            if input is None or \
+               not ((input.meta.typ == PacketType.ACK and self.valid_seq(input.meta.seq)) or
+                    (input.meta.typ == PacketType.FIN and input.meta.seq == self.seq_start)):
+                if (now - self.wait_start).total_seconds() > self.ACK_WAIT_S:
                     self.wait_start = now
                     self.state = self.State.INIT
-            else:
-                ack_delay = (now - self.packet_sent[input.meta.seq]).microseconds
-                self.cur_delay_us = self.protocol.delay_step(self.cur_delay_us, ack_delay)
+                    return
+            elif input.meta.typ == PacketType.ACK:
+                ack_delay = (now - self.packet_sent[input.meta.seq]).total_seconds()
+                self.cur_delay = min(20 * PacketProtocol.DEFAULT_DELAY, self.protocol.delay_step(self.cur_delay, ack_delay))
+                self.logger.debug(f"Adjusting current delay to {self.cur_delay}")
                 self.wait_start = now
                 if input.meta.start <= self.first_unack and input.meta.end > self.first_unack:
                     self.first_unack = input.meta.end
+            if input and input.meta.typ == PacketType.FIN:
+                self.protocol.send_packet(Packet(PacketMeta(PacketType.ACK, 0, 0, self.seq_start)))
+                self.state = self.State.FINISHED
+                return
             if self.is_finished:
                 self.protocol.send_packet(Packet(PacketMeta(PacketType.FIN, 0, 0, self.seq_start)))
                 self.wait_start = now
                 self.state = self.State.FIN_WAIT
                 return
+            if (now - self.last_sent).total_seconds() < self.cur_delay:
+                return
             for start in range(self.first_unack, len(self.buf), Packet.SEGMENT_SIZE):
                 cur = datetime.now()
-                if (cur - now).microseconds > 2 * self.cur_delay_us:
+                if (cur - now).total_seconds() > 2 * self.cur_delay:
                     break
                 self.cur_seq = (self.cur_seq + 1) % 2**32
                 end = min(len(self.buf), start + Packet.SEGMENT_SIZE)
@@ -366,13 +378,10 @@ class TCPWriter:
                 self.logger.debug(f"Sending {end - start} bytes")
                 self.protocol.send_packet(Packet(meta, data))
                 self.packet_sent[self.cur_seq] = cur
-            cur = datetime.now()
-            delta = 2 * self.cur_delay_us - (cur - now).microseconds 
-            if delta > 0:
-                sleep(delta / 10**6)
+                self.last_sent = cur
         elif self.state == self.State.FIN_WAIT:
             if input is None or not (input.meta.typ == PacketType.FIN and input.meta.seq == self.seq_start):
-                if (now - self.wait_start).microseconds > self.FIN_WAIT_US:
+                if (now - self.wait_start).total_seconds() > self.FIN_WAIT_S:
                     self.state = self.State.ESTABLISHED
                 return
             self.protocol.send_packet(Packet(PacketMeta(PacketType.ACK, 0, 0, self.seq_start)))
@@ -380,7 +389,7 @@ class TCPWriter:
 
     
     def do_write(self, data: bytes) -> int:
-        self.logger.info(f"Doing write of {len(data)} bytes {self.protocol.udp.local_addr} -> {self.protocol.udp.remote_addr}")
+        self.logger.info(f"Doing write of {len(data)} bytes {self.protocol.udp.local_addr} -> {self.protocol.udp.remote_addr}, {len(self.buf)}, {self.first_unack}")
         while self.state != self.State.ESTABLISHED:
             sleep(PacketProtocol.STEP)
         self.buf += data[::]
@@ -414,7 +423,7 @@ class MyTCPProtocol(UDPBasedProtocol):
         writer_prev_state = self.writer.state 
         logger.info(f"Reader state {reader_prev_state}")
         logger.info(f"Writer state {writer_prev_state}")
-        while not (self.writer.state == TCPWriter.State.FINISHED):
+        while not (self.writer.state == TCPWriter.State.FINISHED and self.reader.state == TCPReader.State.FINISHED):
             if self.is_closed:
                 self.writer.is_finished = True
                 self.reader.is_finished = True
