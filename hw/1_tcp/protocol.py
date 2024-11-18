@@ -36,7 +36,10 @@ logging.config.dictConfig(
         },
         "loggers": {
             "tcp": {
-                "handlers": ["regular_file", "debug_file"],
+                "handlers": [
+                    "regular_file",
+                    "debug_file",
+                ],
             },
         },
     }
@@ -55,14 +58,12 @@ class UDPBasedProtocol:
         self.remote_addr = remote_addr
         self.udp_socket.bind(local_addr)
 
-    def sendto(self, data) -> int:
+    def sendto(self, data: bytes) -> int:
         self.udp_logger.debug(f"Sending {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
         res = self.udp_socket.sendto(data, self.remote_addr)
-        self.udp_logger.debug(f"Sent {len(data)} bytes {self.local_addr} -> {self.remote_addr}")
         return res
 
-    def recvfrom(self, n) -> bytes:
-        self.udp_logger.debug(f"Receiving {n} bytes on {self.local_addr}")
+    def recvfrom(self, n: int) -> bytes:
         msg, addr = self.udp_socket.recvfrom(n)
         self.udp_logger.debug(f"Received {len(msg)} bytes {addr} -> {self.local_addr}")
         return msg
@@ -125,7 +126,7 @@ def bytes_to_meta(byte_meta: bytes) -> PacketMeta:
 
 
 class Packet:
-    SEGMENT_SIZE = 100
+    SEGMENT_SIZE = 200
     PACKET_SIZE = PacketMeta.META_SIZE + SEGMENT_SIZE
 
     meta: PacketMeta
@@ -144,7 +145,7 @@ class Packet:
         return iter((self.meta, self.segment))
 
 class PacketProtocol:
-    DEFAULT_DELAY = 0.02
+    DEFAULT_DELAY = 0.01
     MAX_DELAY = 0.2
     STEP = 0.0001
 
@@ -173,9 +174,7 @@ class PacketProtocol:
     
     def get_one_packet(self, timeout: float | None = None):
         if timeout:
-            self.logger.debug(f"Selecting for packet with timeout {timeout}")
             readable, _, _ = select([self.udp.udp_socket], [], [], timeout)
-            self.logger.debug(f"Select finished, result {readable != []}")
             if not readable:
                 return None
         return self.receive_packet()
@@ -256,13 +255,14 @@ class TCPReader:
                 self.protocol.send_packet(Packet(PacketMeta(PacketType.FIN, 0, 0, self.seq_start)))
                 self.state = self.State.FIN_WAIT
                 return
+            self.last_seq = input.meta.seq
             if input.meta.start > self.first_unreceived:
                 return
             if self.first_unreceived < input.meta.end:
                 self.logger.debug(f"Received {input.meta.end - self.first_unreceived} new bytes")
                 input_start = self.first_unreceived - input.meta.start
                 input_end = input.meta.end - input.meta.start
-                self.buf += input.segment[input_start:input_end][::]
+                self.buf += input.segment[input_start:input_end]
                 self.first_unreceived = input.meta.end
                 assert len(self.buf) == self.first_unreceived
             self.protocol.send_packet(Packet(PacketMeta(PacketType.ACK, input.meta.start, input.meta.end, input.meta.seq)))
@@ -275,11 +275,15 @@ class TCPReader:
             self.state = self.State.FINISHED
 
     def do_read(self, n: int) -> bytes:
-        self.logger.debug(f"Doing read of {n} bytes on {self.protocol.udp.local_addr}")
+        checkpoint = self.first_unreceived
+        LOG_COUNT = 50000
         while self.buf_ptr + n > self.first_unreceived:
             sleep(PacketProtocol.STEP)
+            if self.first_unreceived >= checkpoint + LOG_COUNT:
+                checkpoint = self.first_unreceived
+                self.logger.info(f"Read {self.first_unreceived - self.buf_ptr} bytes...")
         self.logger.debug(f"Done read of {n} bytes on {self.protocol.udp.local_addr}") 
-        res = self.buf[self.buf_ptr:self.buf_ptr + n][::]
+        res = self.buf[self.buf_ptr:self.buf_ptr + n]
         self.buf_ptr += n
         return res
 
@@ -360,19 +364,19 @@ class TCPWriter:
                 self.wait_start = now
                 self.state = self.State.FIN_WAIT
                 return
-            if (now - self.last_sent).total_seconds() < self.cur_delay:
+            now = datetime.now()
+            if (now - self.last_sent).total_seconds() < self.cur_delay * 0.75:
                 return
             sent_count = 0
             for start in range(self.first_unack, len(self.buf), Packet.SEGMENT_SIZE):
                 cur = datetime.now()
-                if sent_count >= 100:
+                if sent_count >= 5 or (cur - now).total_seconds() > self.cur_delay:
                     break
                 self.cur_seq = (self.cur_seq + 1) % 2**32
                 end = min(len(self.buf), start + Packet.SEGMENT_SIZE)
                 meta = PacketMeta(PacketType.DATA, start, end, self.cur_seq)
-                data = self.buf[start:end][::]
+                data = self.buf[start:end]
                 data += bytes(Packet.SEGMENT_SIZE - len(data))
-                self.logger.debug(f"Sending {end - start} bytes")
                 self.protocol.send_packet(Packet(meta, data))
                 self.packet_sent[self.cur_seq] = cur
                 self.last_sent = cur
@@ -389,13 +393,9 @@ class TCPWriter:
     def do_write(self, data: bytes) -> int:
         if self.state == self.State.DEFAULT:
             self.state = self.State.INIT
-        self.logger.debug(f"Doing write of {len(data)} bytes {self.protocol.udp.local_addr} -> {self.protocol.udp.remote_addr}, {len(self.buf)}, {self.first_unack}")
         while self.state != self.State.ESTABLISHED:
             sleep(PacketProtocol.STEP)
-        self.buf += data[::]
-#        while self.first_unack < len(self.buf):
-#            sleep(PacketProtocol.STEP)
-        self.logger.debug(f"Done write of {len(data)} bytes {self.protocol.udp.local_addr} -> {self.protocol.udp.remote_addr}")
+        self.buf += data
         return len(data)
 
 
