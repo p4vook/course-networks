@@ -6,3 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     privileged: true
+    volumes:
+      - type: bind
+        source: logs
+        target: /app/logs
